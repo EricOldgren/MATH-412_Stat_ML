@@ -9,14 +9,17 @@ from torch.utils.data import DataLoader, random_split
 from torch.utils.data import SubsetRandomSampler
 from torch.utils.data import sampler
 from skimage.metrics import structural_similarity, peak_signal_noise_ratio
+from PIL import Image
 import numpy as np
 import matplotlib.colors as mcolors
+import io
 
 # Hyperparameters
 LEARNING_RATE = 0.001
 BATCH_SIZE = 8
 NUM_EPOCHS = 100
 EARLY_STOPPING_EPOCHS = 20
+JPEG_COMPRESSION = 192
 
 if torch.cuda.is_available():
     print(f"GPU: {torch.cuda.get_device_name(0)} is available.")
@@ -48,15 +51,6 @@ def get_dataloaders(batch_size, num_workers=0, train_transforms=None, test_trans
     test_loader = DataLoader(dataset=test_dataset, batch_size=batch_size, num_workers=num_workers, shuffle=False)
     return train_loader, val_loader, test_loader
 
-train_loader, val_loader, test_loader = get_dataloaders(batch_size=BATCH_SIZE, num_workers=2)
-train_length = len(train_loader.dataset)
-val_length = len(val_loader.dataset)
-test_length = len(test_loader.dataset)
-total_length = train_length + val_length + test_length
-print(f'Length of train dataset: {train_length} ({train_length/total_length})')
-print(f'Length of validation dataset: {val_length} ({val_length/total_length})')
-print(f'Length of test dataset: {test_length} ({test_length/total_length})')
-
 class AutoEncoder(nn.Module):
     def __init__(self):
         super().__init__()
@@ -64,32 +58,28 @@ class AutoEncoder(nn.Module):
                 nn.Conv2d(3, 32, stride=1, kernel_size=3, padding=1),
                 nn.LeakyReLU(0.01),
                 nn.MaxPool2d(kernel_size=2, stride=2),
-                #nn.Conv2d(32, 64, stride=1, kernel_size=3, padding=1),
-                #nn.LeakyReLU(0.01),
-                #nn.MaxPool2d(kernel_size=2, stride=2),
+                nn.Conv2d(32, 64, stride=1, kernel_size=3, padding=1),
+                nn.LeakyReLU(0.01),
+                nn.MaxPool2d(kernel_size=2, stride=2),
                 #nn.Conv2d(64, 128, stride=1, kernel_size=3, padding=1),
                 #nn.LeakyReLU(0.01),
                 #nn.MaxPool2d(kernel_size=2, stride=2),
                 #nn.Conv2d(128, 256, stride=1, kernel_size=3, padding=1),
                 #nn.LeakyReLU(0.01),
                 #nn.MaxPool2d(kernel_size=2, stride=2),
-                #nn.Flatten(),
-                #nn.Linear(4096, 4096),
-                nn.Conv2d(32, 8, stride=1, kernel_size=3, padding=1),
+                nn.Conv2d(64, 3, stride=1, kernel_size=3, padding=1),
         )
         self.decoder = nn.Sequential(
-                #nn.Linear(4096, 4096),
-                #nn.Unflatten(1, (8, 8, 8)),
-                nn.ConvTranspose2d(8, 32, stride=1, kernel_size=3, padding=1),
+                nn.ConvTranspose2d(3, 64, stride=1, kernel_size=3, padding=1),
                 #nn.LeakyReLU(0.01),
                 #nn.Upsample(16),
                 #nn.ConvTranspose2d(256, 128, stride=1, kernel_size=3, padding=1),
                 #nn.LeakyReLU(0.01),
                 #nn.Upsample(32),
                 #nn.ConvTranspose2d(128, 64, stride=1, kernel_size=3, padding=1),
-                #nn.LeakyReLU(0.01),
-                #nn.Upsample(64),
-                #nn.ConvTranspose2d(64, 32, stride=1, kernel_size=3, padding=1),
+                nn.LeakyReLU(0.01),
+                nn.Upsample(64),
+                nn.ConvTranspose2d(64, 32, stride=1, kernel_size=3, padding=1),
                 nn.LeakyReLU(0.01),
                 nn.Upsample(128),
                 nn.ConvTranspose2d(32, 3, stride=1, kernel_size=3, padding=1),
@@ -114,13 +104,6 @@ class AutoEncoder(nn.Module):
 
     def decode(self, x):
         return self.decoder(x)
-
-model = AutoEncoder().to(device)
-#model.load_state_dict(torch.load('imageCompression50epochs.pt', weights_only=True))
-loss_function = torch.nn.MSELoss()
-optimizer = torch.optim.AdamW(model.parameters(),
-                             lr = LEARNING_RATE,
-                             weight_decay = 0.01)
 
 def train_autoencoder(num_epochs, model, optimizer, train_loader, val_loader, early_stopping_epochs, save_model=None):
     losses = []
@@ -167,20 +150,6 @@ def train_autoencoder(num_epochs, model, optimizer, train_loader, val_loader, ea
         torch.save(model.state_dict(), save_model)
     return losses, val_losses, outputs
 
-def plot_latent(model, test_loader):
-  latents = []
-  labels = []
-  for batch_idx, (features, label) in enumerate(test_loader):
-    model.eval()
-    latent = model.encode(features).detach().numpy()
-    label = label.detach().numpy()
-    latents.extend(latent)
-    labels.extend(label)
-
-  for idx, point in enumerate(latents):
-    plt.scatter(point[0], point[1], marker='.', s=20, color=colors[labels[idx]])
-  plt.show()
-
 def plot_loss_curve(losses, val_losses):
     plt.title('Loss curve')
     plt.xlabel('Iterations')
@@ -188,44 +157,83 @@ def plot_loss_curve(losses, val_losses):
     plt.plot(losses, label='Train loss')
     plt.plot(val_losses, label='Validation loss')
     plt.legend()
+    plt.savefig('loss_curve.png')
     plt.show()
 
 def sigmoid(z):
     return 1/(1 + np.exp(-z))
 
-losses, val_losses, outputs = train_autoencoder(num_epochs=NUM_EPOCHS, model=model, optimizer=optimizer, train_loader=train_loader, val_loader=val_loader, early_stopping_epochs=EARLY_STOPPING_EPOCHS, save_model="model1.pt")
 
-#plot_latent(model=model, test_loader=test_loader)
-plot_loss_curve(losses, val_losses)
+test_lossesTotal = []
+ssimTotal = []
+psnrTotal = []
+ssimJPEGTotal = []
+psnrJPEGTotal = []
+for i in range(1):
+    train_loader, val_loader, test_loader = get_dataloaders(batch_size=BATCH_SIZE, num_workers=2)
+    train_length = len(train_loader.dataset)
+    val_length = len(val_loader.dataset)
+    test_length = len(test_loader.dataset)
+    total_length = train_length + val_length + test_length
+    print(f'Length of train dataset: {train_length} ({train_length/total_length})')
+    print(f'Length of validation dataset: {val_length} ({val_length/total_length})')
+    print(f'Length of test dataset: {test_length} ({test_length/total_length})')
+    
+    model = AutoEncoder().to(device)
+    loss_function = torch.nn.MSELoss()
+    optimizer = torch.optim.AdamW(model.parameters(),
+                                 lr = LEARNING_RATE,
+                                 weight_decay = 0.01)
+    
+    losses, val_losses, outputs = train_autoencoder(num_epochs=NUM_EPOCHS, model=model, optimizer=optimizer, train_loader=train_loader, val_loader=val_loader, early_stopping_epochs=EARLY_STOPPING_EPOCHS, save_model=f"model{i}.pt")
+    
+    plot_loss_curve(losses, val_losses)
+    
+    f, ax = plt.subplots(3, BATCH_SIZE, figsize=(15, 5))
+    model.eval()
+    with torch.no_grad():
+        test_losses = []
+        ssim = []
+        psnr = []
+        ssimJPEG = []
+        psnrJPEG = []
+        for batch_idx, (test_features, _) in enumerate(test_loader):
+            test_features = test_features.to(device)
+            test_output = model(test_features)
 
-f, ax = plt.subplots(2, BATCH_SIZE, figsize=(15, 5))
-model.eval()
-with torch.no_grad():
-    test_losses = []
-    ssim = []
-    psnr = []
-    for batch_idx, (test_features, _) in enumerate(test_loader):
-        test_features = test_features.to(device)
-        test_output = model(test_features)
-        #compr = model.encode(test_features)
-        test_loss = loss_function(test_output, test_features)
-        test_losses.append(test_loss.item())
-        for idx, image in enumerate(test_features):
-            input_image = np.transpose(image.cpu().numpy(), (1,2,0))
-            output_image = np.transpose(test_output[idx].cpu().detach().numpy(),(1,2,0))
-            #compr_image = sigmoid(np.transpose(compr[idx].cpu().detach().numpy(),(1,2,0)))
-            ssim.append(structural_similarity(input_image, output_image, data_range=1, channel_axis=2))
-            psnr.append(peak_signal_noise_ratio(input_image, output_image, data_range=1))
+            test_loss = loss_function(test_output, test_features)
+            test_losses.append(test_loss.item())
+            for idx, image in enumerate(test_features):
+                input_image = np.transpose(image.cpu().numpy(), (1,2,0))
+                output_image = np.transpose(test_output[idx].cpu().detach().numpy(),(1,2,0))
 
-            if batch_idx == 0:
-                plt.imsave(f"original{idx}.png", input_image)
-                plt.imsave(f"output{idx}.png", output_image)
-            
-                ax[0, idx].imshow(input_image)
-                #ax[1, idx].imshow(compr_image)
-                ax[1, idx].imshow(output_image)
+                ssim.append(structural_similarity(input_image, output_image, data_range=1, channel_axis=2))
+                psnr.append(peak_signal_noise_ratio(input_image, output_image, data_range=1))
 
-plt.show()
-print(f'Test Loss: {np.mean(test_losses)}')
-print(f'Average SSIM: {np.mean(ssim)}')
-print(f'Average PSNR: {np.mean(psnr)}')
+                output = io.BytesIO()
+                image = Image.fromarray(np.uint8(input_image*255))
+    
+                image.save(output, format='JPEG2000', quality_mode='rates', quality_layers=[JPEG_COMPRESSION], irreversible=True, mct=1)
+                enc = np.array(Image.open(output))
+                output.close()
+
+                ssimJPEG.append(structural_similarity(input_image*255, enc, data_range=255, channel_axis=2))
+                psnrJPEG.append(peak_signal_noise_ratio(input_image*255, enc, data_range=255))
+    
+                if batch_idx == 0:
+                    ax[0, idx].imshow(input_image)
+                    ax[1, idx].imshow(enc)
+                    ax[2, idx].imshow(output_image)
+    
+    plt.show()
+    test_lossesTotal.append(np.mean(test_losses))
+    ssimTotal.append(np.mean(ssim))
+    psnrTotal.append(np.mean(psnr))
+    ssimJPEGTotal.append(np.mean(ssimJPEG))
+    psnrJPEGTotal.append(np.mean(psnrJPEG))
+    
+print(f'Test Loss: {np.mean(test_lossesTotal)}')
+print(f'Average SSIM: {np.mean(ssimTotal)}')
+print(f'Average PSNR: {np.mean(psnrTotal)}')
+print(f'Average SSIM JPEG: {np.mean(ssimJPEGTotal)}')
+print(f'Average PSNR JPEG: {np.mean(psnrJPEGTotal)}')
